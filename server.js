@@ -18,7 +18,8 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  port: process.env.DB_PORT
+  port: process.env.DB_PORT,
+  charset: 'utf8mb4'
 });
 
 const cronDB = mysql.createPool({
@@ -26,7 +27,8 @@ const cronDB = mysql.createPool({
   user: process.env.CRON_DB_USER,
   password: process.env.CRON_DB_PASSWORD,
   database: process.env.CRON_DB_NAME,
-  port: process.env.CRON_DB_PORT
+  port: process.env.CRON_DB_PORT,
+  charset: 'utf8mb4'
 });
 
 /* ========== Utility functions ========== */
@@ -74,7 +76,7 @@ async function ensureTable(queryName, sampleRow) {
   if (rows.length > 0) return; // มีแล้ว
 
   const uniqueKeys = [...new Set(Object.keys(sampleRow))];
-  const columnsDef = uniqueKeys.map(k => `\`${k}\` TEXT`).join(', ');
+  const columnsDef = uniqueKeys.map(k => `\`${k.replace(/`/g, '')}\` TEXT`).join(', ');
 
   const createSQL = `
     CREATE TABLE \`${queryName}\` (
@@ -198,14 +200,17 @@ app.post('/query/:queryName/:hosCode', async (req, res) => {
 /* ========== ลบตาราง ========== */
 app.post('/delete-query/:queryName', async (req, res) => {
   const queryName = req.params.queryName?.replace(/[^a-zA-Z0-9_]/g, '');
-  if (!queryName) return res.status(400).send('❌ queryName ไม่ถูกต้อง');
+  if (!queryName) {
+    return res.status(400).json({ success: false, error: '❌ queryName ไม่ถูกต้อง' });
+  }
+
   try {
     await pool.query(`DROP TABLE IF EXISTS \`${queryName}\``);
     console.log(`🧹 ลบตาราง ${queryName} แล้ว`);
-    res.send(`✅ ลบตาราง ${queryName} สำเร็จ`);
+    res.json({ success: true, message: `✅ ลบตาราง ${queryName} สำเร็จ` });
   } catch (err) {
     console.error(`❌ ลบตาราง ${queryName} ล้มเหลว:`, err.message);
-    res.status(500).send(`❌ ล้มเหลว: ${err.message}`);
+    res.status(500).json({ success: false, error: `❌ ล้มเหลว: ${err.message}` });
   }
 });
 
