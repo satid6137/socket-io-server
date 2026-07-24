@@ -488,6 +488,8 @@ app.post("/send-notify-now", express.json(), async (req, res) => {
 
 /* ========== ลบตาราง (เวอร์ชันแก้สมบูรณ์) ========== */
 app.post("/delete-query/:queryName", async (req, res) => {
+	res.setHeader("Content-Type", "application/json; charset=utf-8");
+	
   try {
     // ❗ ใช้ชื่อจริงที่ PHP ส่งมา ไม่ sanitize ทิ้ง - หรือ .
     let queryName = req.params.queryName;
