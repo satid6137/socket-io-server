@@ -10,6 +10,9 @@ import fetch from "node-fetch";
 import zlib from "zlib";
 import fs from "fs";
 
+// ⭐ Global cron storage
+let cronJobs = [];   // เก็บ cron jobs ที่สร้างทั้งหมด
+
 dotenv.config();
 
 /* ========== CONFIG ========== */
@@ -551,6 +554,18 @@ app.post("/delete-query/:queryName", async (req, res) => {
   }
 });
 
+/* ========== เพิ่ม endpoint ให้ PHP เรียก reload cron========== */
+app.post("/reload-cron", async (req, res) => {
+  try {
+    await loadCronJobsFromDB();
+    res.json({ success: true, message: "cron reloaded" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
 /* ========== ดึงข้อมูลย้อนหลัง ========== */
 app.get("/data/:queryName/:hosCode", async (req, res) => {
   const { queryName, hosCode } = req.params;
@@ -644,17 +659,19 @@ app.get("/query/:queryName/:hosCode", async (req, res) => {
 /* ========== Cron Jobs ========== */
 async function loadCronJobsFromDB() {
   try {
-    /* ---------------------------------------------------------
-     * 1) CRON สำหรับดึงข้อมูล (save_query)
-     * --------------------------------------------------------- */
+    console.log("🔄 Reloading cron jobs from DB...");
+
+    // 1) หยุด cron เดิมทั้งหมดก่อน
+    cronJobs.forEach(job => job.stop());
+    cronJobs = [];
+
+    // 2) โหลด cron สำหรับ save_query
     const [rows] = await cronDB.query(`
       SELECT sq.query_name, sq.hos_code, cp.cron_expr, cp.label, cp.notify_mode
       FROM save_query sq
       JOIN cron_profiles cp ON sq.cron_id = cp.id
       WHERE cp.cron_expr IS NOT NULL AND cp.cron_expr <> ''
     `);
-
-    console.log("🔍 cron rows (save_query):", rows.length);
 
     const grouped = {};
     for (const row of rows) {
@@ -674,49 +691,34 @@ async function loadCronJobsFromDB() {
 
     for (const cronTime in grouped) {
       const { label, tasks } = grouped[cronTime];
-      console.log(
-        `📆 ตั้งเวลา (ดึงข้อมูล) ${label} →`,
-        tasks.map((t) => `${t.queryName}/${t.hosCode}`),
-      );
 
-      cron.schedule(cronTime, async () => {
+      const job = cron.schedule(cronTime, async () => {
         for (const { queryName, hosCode } of tasks) {
           try {
-            // ⭐ เช็คก่อนว่าตารางมีไหม
             const exists = await tableExists(queryName);
-            if (!exists) {
-              console.log(
-                `ℹ️ cron: ตาราง ${queryName} ยังไม่ถูกสร้าง → ข้าม DELETE`,
-              );
-            } else {
+            if (exists) {
               await pool.query(
                 `DELETE FROM \`${queryName}\` WHERE hoscode = ?`,
                 [hosCode],
               );
             }
 
-            // ⭐ สั่ง client รัน query ต่อ
             await fetch(
               `http://localhost:${PORT}/query/${queryName}/${hosCode}`,
               { method: "POST" },
             );
 
-            console.log(
-              `[${label}] ✅ Triggered fetch ${queryName}/${hosCode}`,
-            );
+            console.log(`[${label}] Triggered ${queryName}/${hosCode}`);
           } catch (err) {
-            console.error(
-              `[${label}] ❌ fetch error ${queryName}/${hosCode}:`,
-              err.message,
-            );
+            console.error(`[${label}] error:`, err.message);
           }
         }
       });
+
+      cronJobs.push(job);
     }
 
-    /* ---------------------------------------------------------
-     * 2) CRON สำหรับแจ้งเตือน (notify_settings)
-     * --------------------------------------------------------- */
+    // 3) โหลด cron สำหรับ notify_settings
     const [notifyRows] = await cronDB.query(`
       SELECT ns.query_name, ns.hos_code, cp.cron_expr, cp.label
       FROM notify_settings ns
@@ -724,81 +726,55 @@ async function loadCronJobsFromDB() {
       WHERE cp.cron_expr IS NOT NULL AND cp.cron_expr <> ''
     `);
 
-    console.log("🔍 cron rows (notify_settings):", notifyRows.length);
-
     for (const row of notifyRows) {
-      const { query_name, hos_code, cron_expr, label } = row;
-
-      console.log(
-        `📆 ตั้งเวลา (แจ้งเตือน) ${label} → ${query_name}/${hos_code}`,
-      );
-
-      cron.schedule(cron_expr, async () => {
+      const job = cron.schedule(row.cron_expr, async () => {
         try {
-          const notifyConfig = await fetchNotifyConfig(query_name, hos_code);
-          if (!notifyConfig || notifyConfig.notify_type === "none") {
-            console.log(
-              `ℹ️ ไม่มี notify_type สำหรับ ${query_name}/${hos_code}`,
-            );
-            return;
-          }
+          const notifyConfig = await fetchNotifyConfig(row.query_name, row.hos_code);
+          if (!notifyConfig || notifyConfig.notify_type === "none") return;
 
-          // ⭐ เช็คก่อนว่าตารางมีไหม
-          const exists = await tableExists(query_name);
-          if (!exists) {
-            console.log(`ℹ️ notify cron: ตาราง ${query_name} ยังไม่ถูกสร้าง`);
-            return;
-          }
+          const exists = await tableExists(row.query_name);
+          if (!exists) return;
 
-          // ดึงข้อมูลทั้งหมดจากตาราง
           const [rows] = await pool.query(
-            `SELECT * FROM \`${query_name}\` WHERE hoscode = ? ORDER BY id ASC`,
-            [hos_code],
+            `SELECT * FROM \`${row.query_name}\` WHERE hoscode = ? ORDER BY id ASC`,
+            [row.hos_code],
           );
 
-          if (!rows || rows.length === 0) {
-            console.log(`ℹ️ ไม่มีข้อมูลใน ${query_name}/${hos_code}`);
-            return;
-          }
+          if (!rows || rows.length === 0) return;
 
-          // ⭐ ถ้าเป็น empty-case (last_update = NULL) → ไม่ต้องส่ง LINE
-          if (rows.length === 1 && rows[0].last_update === null) {
-            console.log(
-              `ℹ️ empty-case: ไม่ส่ง LINE สำหรับ ${query_name}/${hos_code}`,
-            );
-            return;
-          }
-
-          // สร้างข้อความ
           let msg = "";
-
-          if (notifyConfig && notifyConfig.description) {
-            msg += `📌 ${notifyConfig.description}\n\n`;
-          }
-
-          msg += `📊 แจ้งเตือนตามเวลา: ${query_name}/${hos_code}\n`;
+		  
+		  if (notify && notify.description) {
+      msg += `📌 ${notify.description}\n\n`;
+    }
+		  
+		  msg += `📊 แจ้งเตือน: ${row.query_name}/${row.hos_code}\n`;
           msg += `จำนวนทั้งหมด ${rows.length} รายการ\n\n`;
 
           rows.forEach((r, i) => {
             msg += `#${i + 1}\n`;
-            for (const col in r) {
-              msg += `• ${col}: ${r[col]}\n`;
-            }
+            for (const col in r) msg += `• ${col}: ${r[col]}\n`;
             msg += `\n`;
           });
 
           await sendDynamicNotify(notifyConfig, msg);
 
-          console.log(`🔔 ส่งแจ้งเตือนตามเวลา: ${query_name}/${hos_code}`);
         } catch (err) {
-          console.error(`❌ notify cron error:`, err.message);
+          console.error(`notify cron error:`, err.message);
         }
       });
+
+      cronJobs.push(job);
     }
+
+    console.log(`✅ cron loaded: ${cronJobs.length} jobs`);
+
   } catch (err) {
-    console.error("❌ โหลด cron jobs จาก DB ล้มเหลว:", err.message);
+    console.error("❌ loadCronJobsFromDB error:", err.message);
   }
 }
+
+
 
 /* ========== Start Server ========== */
 const PORT = process.env.PORT || 3000;
