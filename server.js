@@ -709,6 +709,12 @@ async function loadCronJobsFromDB() {
             );
 
             console.log(`[${label}] Triggered ${queryName}/${hosCode}`);
+			
+			await cronDB.query(
+  "UPDATE save_query SET last_post_at = NOW() WHERE query_name = ? AND hos_code = ?",
+  [queryName, hosCode]
+);
+		
           } catch (err) {
             console.error(`[${label}] error:`, err.message);
           }
