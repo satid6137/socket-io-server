@@ -11,9 +11,13 @@ import zlib from "zlib";
 import fs from "fs";
 
 // ⭐ Global cron storage
-let cronJobs = [];   // เก็บ cron jobs ที่สร้างทั้งหมด
+let cronJobs = []; // เก็บ cron jobs ที่สร้างทั้งหมด
 
 dotenv.config();
+
+const SERVER_VERSION = 15; // ← ตั้งเป็น 13 ตามที่คุณต้องการ
+
+const hosCode = process.env.HOSCODE;
 
 /* ========== CONFIG ========== */
 const phpApiUrl = process.env.PHP_API_URL;
@@ -212,10 +216,49 @@ io.on("connection", (socket) => {
   socket.on("register", (clientInfo) => {
     const { hosCode, hosName } = clientInfo;
     clients[hosCode] = socket;
+
     console.log(
       `✅ REGISTER hosCode=${hosCode}, hosName=${hosName}, socket=${socket.id}`,
     );
+
     socket.emit("greeting", `<-- Server: ยินดีต้อนรับ [${hosCode}]`);
+
+    // ⭐ trigger ให้ server เขียน server_version
+    socket.emit("serverVersion", { hosCode });
+  });
+
+  // ⭐ รับ version จาก nodejs-client ตอน connect
+  socket.on("clientVersion", async ({ hosCode, version }) => {
+    console.log(`📌 รับ clientVersion จาก ${hosCode}: V.${version}`);
+
+    try {
+      await pool.query(
+        `UPDATE version 
+   SET client_version = ?, updated_at = NOW()
+   WHERE hoscode = ?`,
+        [version, hosCode],
+      );
+      console.log(`✅ บันทึก clientVersion สำเร็จ: ${hosCode} → V.${version}`);
+    } catch (err) {
+      console.error(`❌ บันทึก clientVersion ล้มเหลว: ${err.message}`);
+    }
+  });
+
+  // ⭐ รับ telemed_version จาก telemedapidocs
+  socket.on("telemedVersion", async ({ hosCode, version }) => {
+    console.log(`📌 รับ telemedVersion จาก ${hosCode}: V.${version}`);
+
+    try {
+      await pool.query(
+        `UPDATE version 
+   SET telemed_version = ?, updated_at = NOW()
+   WHERE hoscode = ?`,
+        [version, hosCode],
+      );
+      console.log(`✅ บันทึก telemedversion สำเร็จ: ${hosCode} → V.${version}`);
+    } catch (err) {
+      console.error(`❌ บันทึก telemedversion ล้มเหลว: ${err.message}`);
+    }
   });
 
   socket.on("clientMetric", (metric) => {
@@ -467,7 +510,7 @@ app.post("/send-notify-now", express.json(), async (req, res) => {
     }
 
     // ⭐ แก้ตัวแปรผิดชื่อ
-    msg += `📊 แจ้งเตือนตามเวลา: ${queryName}/${hosCode}\n`;
+    msg += `📊 แจ้งเตือนตามคำสั่ง: ${queryName}/${hosCode}\n`;
     msg += `จำนวนทั้งหมด ${rows.length} รายการ\n\n`;
 
     rows.forEach((r, i) => {
@@ -491,8 +534,8 @@ app.post("/send-notify-now", express.json(), async (req, res) => {
 
 /* ========== ลบตาราง (เวอร์ชันแก้สมบูรณ์) ========== */
 app.post("/delete-query/:queryName", async (req, res) => {
-	res.setHeader("Content-Type", "application/json; charset=utf-8");
-	
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+
   try {
     // ❗ ใช้ชื่อจริงที่ PHP ส่งมา ไม่ sanitize ทิ้ง - หรือ .
     let queryName = req.params.queryName;
@@ -563,8 +606,6 @@ app.post("/reload-cron", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
-
 
 /* ========== ดึงข้อมูลย้อนหลัง ========== */
 app.get("/data/:queryName/:hosCode", async (req, res) => {
@@ -662,7 +703,7 @@ async function loadCronJobsFromDB() {
     console.log("🔄 Reloading cron jobs from DB...");
 
     // 1) หยุด cron เดิมทั้งหมดก่อน
-    cronJobs.forEach(job => job.stop());
+    cronJobs.forEach((job) => job.stop());
     cronJobs = [];
 
     // 2) โหลด cron สำหรับ save_query
@@ -709,12 +750,11 @@ async function loadCronJobsFromDB() {
             );
 
             console.log(`[${label}] Triggered ${queryName}/${hosCode}`);
-			
-			await cronDB.query(
-  "UPDATE save_query SET last_post_at = NOW() WHERE query_name = ? AND hos_code = ?",
-  [queryName, hosCode]
-);
-		
+
+            await cronDB.query(
+              "UPDATE save_query SET last_post_at = NOW() WHERE query_name = ? AND hos_code = ?",
+              [queryName, hosCode],
+            );
           } catch (err) {
             console.error(`[${label}] error:`, err.message);
           }
@@ -733,61 +773,93 @@ async function loadCronJobsFromDB() {
     `);
 
     for (const row of notifyRows) {
-  const job = cron.schedule(row.cron_expr, async () => {
-    try {
-      const notifyConfig = await fetchNotifyConfig(row.query_name, row.hos_code);
-      if (!notifyConfig || notifyConfig.notify_type === "none") {
-        console.log(`ℹ️ ไม่มี notify_type สำหรับ ${row.query_name}/${row.hos_code}`);
-        return;
-      }
+      const job = cron.schedule(row.cron_expr, async () => {
+        try {
+          const notifyConfig = await fetchNotifyConfig(
+            row.query_name,
+            row.hos_code,
+          );
+          if (!notifyConfig || notifyConfig.notify_type === "none") {
+            console.log(
+              `ℹ️ ไม่มี notify_type สำหรับ ${row.query_name}/${row.hos_code}`,
+            );
+            return;
+          }
 
-      const exists = await tableExists(row.query_name);
-      if (!exists) {
-        console.log(`ℹ️ notify cron: ตาราง ${row.query_name} ยังไม่ถูกสร้าง`);
-        return;
-      }
+          const exists = await tableExists(row.query_name);
+          if (!exists) {
+            console.log(
+              `ℹ️ notify cron: ตาราง ${row.query_name} ยังไม่ถูกสร้าง`,
+            );
+            return;
+          }
 
-      const [rows] = await pool.query(
-        `SELECT * FROM \`${row.query_name}\` WHERE hoscode = ? ORDER BY id ASC`,
-        [row.hos_code]
-      );
+          const [rows] = await pool.query(
+            `SELECT * FROM \`${row.query_name}\` WHERE hoscode = ? ORDER BY id ASC`,
+            [row.hos_code],
+          );
 
-      if (!rows || rows.length === 0) return;
+          if (!rows || rows.length === 0) return;
 
-      let msg = "";
+          let msg = "";
 
-      // ⭐ ใช้ notifyConfig.description เหมือน manual
-      if (notifyConfig.description) {
-        msg += `📌 ${notifyConfig.description}\n\n`;
-      }
+          // ⭐ ใช้ notifyConfig.description เหมือน manual
+          if (notifyConfig.description) {
+            msg += `📌 ${notifyConfig.description}\n\n`;
+          }
 
-      msg += `📊 แจ้งเตือนตามเวลา: ${row.query_name}/${row.hos_code}\n`;
-      msg += `จำนวนทั้งหมด ${rows.length} รายการ\n\n`;
+          msg += `📊 แจ้งเตือนตามเวลา: ${row.query_name}/${row.hos_code}\n`;
+          msg += `จำนวนทั้งหมด ${rows.length} รายการ\n\n`;
 
-      rows.forEach((r, i) => {
-        msg += `#${i + 1}\n`;
-        for (const col in r) {
-          msg += `• ${col}: ${r[col]}\n`;
+          rows.forEach((r, i) => {
+            msg += `#${i + 1}\n`;
+            for (const col in r) {
+              msg += `• ${col}: ${r[col]}\n`;
+            }
+            msg += `\n`;
+          });
+
+          await sendDynamicNotify(notifyConfig, msg);
+
+          console.log(
+            `🔔 ส่งแจ้งเตือนตามเวลา: ${row.query_name}/${row.hos_code}`,
+          );
+        } catch (err) {
+          console.error(`❌ notify cron error:`, err.message);
         }
-        msg += `\n`;
       });
 
-      await sendDynamicNotify(notifyConfig, msg);
-
-      console.log(`🔔 ส่งแจ้งเตือนตามเวลา: ${row.query_name}/${row.hos_code}`);
-    } catch (err) {
-      console.error(`❌ notify cron error:`, err.message);
+      cronJobs.push(job);
     }
-  });
-
-  cronJobs.push(job);
-}
-
 
     console.log(`✅ cron loaded: ${cronJobs.length} jobs`);
-
   } catch (err) {
     console.error("❌ loadCronJobsFromDB error:", err.message);
+  }
+}
+
+async function writeServerVersion() {
+  const hosCode = process.env.HOSCODE; // ← nodejs-server มี hosCode ของตัวเอง
+
+  try {
+    // สร้าง row ถ้ายังไม่มี
+    await pool.query(
+      `INSERT INTO version (hoscode) VALUES (?)
+       ON DUPLICATE KEY UPDATE hoscode = hoscode`,
+      [hosCode],
+    );
+
+    // อัปเดตเฉพาะ server_version
+    await pool.query(
+      `UPDATE version 
+       SET server_version = ?, updated_at = NOW()
+       WHERE hoscode = ?`,
+      [SERVER_VERSION, hosCode],
+    );
+
+    console.log(`✅ serverVersion updated: ${hosCode} → V.${SERVER_VERSION}`);
+  } catch (err) {
+    console.error(`❌ serverVersion update failed: ${err.message}`);
   }
 }
 
@@ -795,5 +867,6 @@ async function loadCronJobsFromDB() {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server พร้อมใช้งานที่ port ${PORT}`);
+  await writeServerVersion();
   await loadCronJobsFromDB();
 });
